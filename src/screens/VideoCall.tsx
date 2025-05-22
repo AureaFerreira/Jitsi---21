@@ -1,6 +1,5 @@
 // src/screens/VideoCall.tsx
-
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   StyleSheet,
@@ -11,32 +10,25 @@ import {
   Linking,
   Text,
   TouchableOpacity,
-  ScrollView,
 } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'VideoCall'>;
 
-// Defina a URL correta da sua API
-const BACKEND_URL =
-  Platform.OS === 'android'
-    ? 'http://10.0.2.2:8000'
-    : 'http://localhost:8000';
-
 export default function VideoCall({ route, navigation }: Props) {
   const { roomName, role } = route.params;
-  const jitsiUrl = `https://meet.jit.si/${roomName}`;
+  const webviewRef = useRef<WebView>(null);
 
   const [checking, setChecking] = useState(true);
   const [granted, setGranted] = useState(false);
-  const [acceptedTerms, setAcceptedTerms] = useState(false);
+  const [acceptedTerms, setAccepted] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [latestExp, setLatestExp] = useState<string>('—');
+  const [apiResponse, setApiResponse] = useState<any>(null);
 
-  const [loadingAnalysis, setLoadingAnalysis] = useState(false);
-  const [analysisResults, setAnalysisResults] = useState<any[]>([]);
-
-  // 1) Permissões Android
+  // Android permissions
   useEffect(() => {
     (async () => {
       if (Platform.OS === 'android') {
@@ -49,8 +41,8 @@ export default function VideoCall({ route, navigation }: Props) {
           res[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] !== 'granted'
         ) {
           Alert.alert(
-            'Permissões necessárias',
-            'Precisamos de câmera e microfone.',
+            'Permissões',
+            'Precisamos de câmera e microfone',
             [
               { text: 'Cancelar', onPress: () => navigation.goBack(), style: 'cancel' },
               { text: 'Configurações', onPress: () => Linking.openSettings() },
@@ -64,207 +56,249 @@ export default function VideoCall({ route, navigation }: Props) {
     })();
   }, [navigation]);
 
-  if (checking) return <FullLoader />;
-  if (!granted) return <PermissionDenied />;
+  // Call API to analyze webcam
+  const callAnalysisApi = async () => {
+    try {
+      const response = await fetch('http:// 192.168.17.1:8000/analyze-webcam');
+      const data = await response.json();
+      setApiResponse(data);
+      console.log('API Response:', data);
+      
+      // Get the most frequent emotion
+      if (data.analysis && data.analysis.length > 0) {
+        const emotions = data.analysis.map((item: any) => item.dominant_emotion);
+        const mostFrequent = emotions.reduce((a: string, b: string) => 
+          emotions.filter((v: string) => v === a).length >= 
+          emotions.filter((v: string) => v === b).length ? a : b
+        );
+        setLatestExp(mostFrequent);
+      }
+    } catch (error) {
+      console.error('API Error:', error);
+      Alert.alert('Erro', 'Não foi possível conectar à API de análise');
+    }
+  };
+
+  if (checking) return <Loader />;
+  if (!granted) return <Denied />;
   if (!acceptedTerms) {
     return (
-      <TermsView
-        onAccept={() => setAcceptedTerms(true)}
+      <TermsScreen
+        onAccept={() => setAccepted(true)}
         onDecline={() => navigation.goBack()}
       />
     );
   }
 
-  // 2) Chama o FastAPI e busca os resultados
-  const handleAnalyze = async () => {
-    setLoadingAnalysis(true);
-    try {
-      console.log('➡️ Fazendo request para', `${BACKEND_URL}/analyze-webcam`);
-      const res = await fetch(`${BACKEND_URL}/analyze-webcam`);
-      console.log('⬅️ Status da resposta:', res.status);
-      if (!res.ok) throw new Error(`Status ${res.status}`);
-      const json = await res.json();
-      console.log('⬅️ JSON recebido:', json);
-      setAnalysisResults(json.analysis || []);
-      Alert.alert('Análise concluída', `Recebemos ${json.analysis.length} frames.`);
-    } catch (e) {
-      console.error(e);
-      Alert.alert('Erro na análise', String(e));
-    } finally {
-      setLoadingAnalysis(false);
+  // Face-api.js injection code
+  const injection = `
+    console.log('▶️ face-api: começando injeção');
+    if (!window.__faceapi_loaded) {
+      window.__faceapi_loaded = true;
+      (async () => {
+        console.log('⏳ face-api: carregando script externo');
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/face-api.js';
+        document.head.appendChild(s);
+        await new Promise(r => s.onload = r);
+        console.log('✅ face-api: library carregada');
+
+        const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+        console.log('⏳ face-api: carregando modelos');
+        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL);
+        console.log('✅ face-api: modelos carregados');
+
+        // espera vídeo remoto
+        console.log('⏳ face-api: aguardando vídeo remoto');
+        const remote = await new Promise(r => {
+          const iv = setInterval(() => {
+            const vids = document.querySelectorAll('video');
+            if (vids.length > 1 && vids[1].readyState === 4) {
+              clearInterval(iv); r(vids[1]);
+            }
+          }, 500);
+        });
+        console.log('✅ face-api: vídeo remoto pronto');
+
+        const canvas = faceapi.createCanvasFromMedia(remote);
+        canvas.style.opacity = '0';
+        document.body.appendChild(canvas);
+        faceapi.matchDimensions(canvas, {
+          width: remote.videoWidth,
+          height: remote.videoHeight,
+        });
+
+        let intervalId = null;
+        window.startAnalysis = () => {
+          if (intervalId) return;
+          console.log('▶️ face-api: análise iniciada');
+          intervalId = setInterval(async () => {
+            try {
+              const det = await faceapi
+                .detectSingleFace(remote, new faceapi.TinyFaceDetectorOptions())
+                .withFaceExpressions();
+              if (det && det.expressions) {
+                const top = Object.entries(det.expressions)
+                  .sort((a,b)=>b[1]-a[1])[0][0];
+                console.log('🎯 face-api: detectou', top);
+                window.ReactNativeWebView.postMessage(top);
+              }
+            } catch (err) {
+              console.error('❌ face-api erro:', err);
+            }
+          }, 2000);
+        };
+        window.stopAnalysis = () => {
+          clearInterval(intervalId);
+          intervalId = null;
+          console.log('⏹️ face-api: análise parada');
+        };
+      })();
+    } else {
+      console.log('ℹ️ face-api: já carregado');
     }
+    true;
+  `;
+
+  const onLoadEnd = () => {
+    setTimeout(() => {
+      webviewRef.current?.injectJavaScript(injection);
+    }, 500);
+  };
+
+  const onMessage = (e: WebViewMessageEvent) => {
+    console.log('[RN] expressão recebida:', e.nativeEvent.data);
+    setLatestExp(e.nativeEvent.data);
+  };
+
+  const toggleAnalysis = () => {
+    if (!analyzing) {
+      // Choose one method:
+      // 1. For face-api.js (in-app analysis)
+      webviewRef.current?.injectJavaScript(`window.startAnalysis();`);
+      
+      // 2. For API analysis (uncomment to use)
+      // callAnalysisApi();
+    } else {
+      webviewRef.current?.injectJavaScript(`window.stopAnalysis();`);
+      setLatestExp('—');
+    }
+    setAnalyzing(!analyzing);
   };
 
   return (
-    <View style={styles.container}>
-      {/* Botão de análise apenas para Psicólogo */}
+    <View style={S.container}>
       {role === 'Psicólogo' && (
-        <View style={styles.analysisContainer}>
-          <TouchableOpacity
-            style={styles.analysisButton}
-            onPress={handleAnalyze}
-            disabled={loadingAnalysis}
-          >
-            {loadingAnalysis ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <Text style={styles.analysisButtonText}>Analisar Expressão</Text>
-            )}
+        <View style={S.bar}>
+          <Text style={S.barText}>Expressão: {latestExp}</Text>
+          <TouchableOpacity style={S.btn} onPress={toggleAnalysis}>
+            <Text style={S.btnText}>
+              {analyzing ? 'Parar Análise' : 'Analisar Expressão'}
+            </Text>
           </TouchableOpacity>
         </View>
       )}
-
-      {/* Exibição dos resultados */}
-      {analysisResults.length > 0 && (
-        <ScrollView style={styles.resultsContainer}>
-          {analysisResults.map((item, index) => (
-            <View key={index} style={styles.resultItem}>
-              <Text style={styles.resultText}>
-                <Text style={styles.bold}>Segundo:</Text> {item.second}
-              </Text>
-              <Text style={styles.resultText}>
-                <Text style={styles.bold}>Dominante:</Text> {item.dominant_emotion}
-              </Text>
-              <Text style={styles.resultText}>
-                <Text style={styles.bold}>Detalhes:</Text> {JSON.stringify(item.emotions)}
-              </Text>
-            </View>
+      
+      {apiResponse && (
+        <View style={S.apiResults}>
+          <Text style={S.apiTitle}>Resultado da API:</Text>
+          {apiResponse.analysis.map((item: any, index: number) => (
+            <Text key={index} style={S.apiText}>
+              {item.second}s: {item.dominant_emotion}
+            </Text>
           ))}
-        </ScrollView>
+        </View>
       )}
-
-      {/* WebView com Jitsi */}
+      
       <WebView
-        source={{ uri: jitsiUrl }}
-        style={styles.webview}
+        ref={webviewRef}
+        source={{ uri: `https://meet.jit.si/${roomName}` }}
+        style={S.webview}
+        onLoadEnd={onLoadEnd}
+        onMessage={onMessage}
         javaScriptEnabled
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
         startInLoadingState
-        renderLoading={() => <FullLoader />}
+        renderLoading={() => <Loader />}
       />
     </View>
   );
 }
 
-// Componentes auxiliares
-const FullLoader = () => (
-  <View style={styles.fullLoader}>
+// Helper components
+const Loader = () => (
+  <View style={S.loader}>
     <ActivityIndicator size="large" color="#4B7BE5" />
   </View>
 );
 
-const PermissionDenied = () => (
-  <View style={styles.fullLoader}>
-    <Text style={styles.infoText}>
-      Habilite câmera e microfone nas configurações.
-    </Text>
+const Denied = () => (
+  <View style={S.loader}>
+    <Text style={{ color:'#666' }}>Permissões negadas.</Text>
   </View>
 );
 
-const TermsView = ({
-  onAccept,
-  onDecline,
-}: {
-  onAccept: () => void;
-  onDecline: () => void;
-}) => (
-  <View style={styles.termsContainer}>
-    <Text style={styles.termsTitle}>Termos e Condições</Text>
-    <Text style={styles.termsText}>
-      • Esta sessão será gravada para fins de registro clínico.{'\n\n'}
-      • Gravações restritas à equipe responsável.{'\n\n'}
+const TermsScreen = ({ onAccept, onDecline }: {onAccept:()=>void; onDecline:()=>void}) => (
+  <View style={S.terms}>
+    <Text style={S.title}>Termos e Condições</Text>
+    <Text style={S.text}>
+      • Esta sessão será gravada.{'\n\n'}
+      • Gravações restritas à equipe.{'\n\n'}
       • Solicite exclusão a qualquer momento.{'\n\n'}
-      • Ao concordar, autoriza armazenamento desta gravação.{'\n\n'}
-      • Todas as informações são confidenciais.
+      • Confidencialidade garantida.
     </Text>
-    <View style={styles.termsButtons}>
-      <TouchableOpacity style={[styles.btn, styles.btnDecline]} onPress={onDecline}>
-        <Text style={styles.btnText}>Recusar</Text>
+    <View style={S.termsBtns}>
+      <TouchableOpacity style={[S.btn, { backgroundColor:'#eee' }]} onPress={onDecline}>
+        <Text style={S.btnText}>Recusar</Text>
       </TouchableOpacity>
-      <TouchableOpacity style={[styles.btn, styles.btnAccept]} onPress={onAccept}>
-        <Text style={[styles.btnText, { color: '#fff' }]}>Aceitar</Text>
+      <TouchableOpacity style={[S.btn, { backgroundColor:'#4B7BE5' }]} onPress={onAccept}>
+        <Text style={[S.btnText, { color:'#fff' }]}>Aceitar</Text>
       </TouchableOpacity>
     </View>
   </View>
 );
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  webview: { flex: 1 },
+// Styles
+const S = StyleSheet.create({
+  container: { flex:1 },
+  webview: { flex:1 },
+  loader: { flex:1, justifyContent:'center', alignItems:'center' },
 
-  fullLoader: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+  bar: { 
+    padding:12, 
+    backgroundColor:'#eef4fb', 
+    flexDirection:'row', 
+    alignItems:'center', 
+    justifyContent:'space-between' 
   },
-  infoText: { textAlign: 'center', color: '#666' },
+  barText: { fontSize:16, fontWeight:'600' },
+  btn: { 
+    paddingVertical:8, 
+    paddingHorizontal:16, 
+    backgroundColor:'#4B7BE5', 
+    borderRadius:20 
+  },
+  btnText: { color:'#fff', fontSize:14, fontWeight:'600' },
 
-  termsContainer: {
-    flex: 1,
-    padding: 24,
-    backgroundColor: '#fff',
-    justifyContent: 'center',
-  },
-  termsTitle: {
-    fontSize: 22,
-    fontWeight: '700',
-    textAlign: 'center',
-    marginBottom: 16,
-  },
-  termsText: {
-    fontSize: 16,
-    lineHeight: 24,
-    color: '#333',
-    marginBottom: 24,
-  },
-  termsButtons: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  btn: {
-    flex: 1,
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  btnDecline: { backgroundColor: '#eee', marginRight: 8 },
-  btnAccept: { backgroundColor: '#4B7BE5', marginLeft: 8 },
-  btnText: { fontSize: 16, fontWeight: '600' },
-
-  analysisContainer: {
-    padding: 12,
-    backgroundColor: '#eef4fb',
-    alignItems: 'center',
-  },
-  analysisButton: {
-    backgroundColor: '#4B7BE5',
-    paddingVertical: 12,
-    paddingHorizontal: 32,
-    borderRadius: 24,
-  },
-  analysisButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-
-  resultsContainer: {
-    maxHeight: 150,
-    backgroundColor: '#fff',
-    padding: 12,
-  },
-  resultItem: {
-    marginBottom: 12,
+  terms: { flex:1, padding:24, justifyContent:'center', backgroundColor:'#fff' },
+  title: { fontSize:22, fontWeight:'700', textAlign:'center', marginBottom:16 },
+  text: { fontSize:16, lineHeight:24, color:'#333', marginBottom:24 },
+  termsBtns: { flexDirection:'row', justifyContent:'space-between' },
+  
+  apiResults: {
+    padding: 10,
+    backgroundColor: '#f5f5f5',
     borderBottomWidth: 1,
     borderBottomColor: '#ddd',
-    paddingBottom: 8,
   },
-  resultText: {
-    fontSize: 14,
-    marginBottom: 4,
+  apiTitle: {
+    fontWeight: 'bold',
+    marginBottom: 5,
   },
-  bold: {
-    fontWeight: '700',
+  apiText: {
+    fontSize: 12,
+    color: '#555',
   },
 });
