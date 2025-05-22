@@ -10,25 +10,33 @@ import {
   ActivityIndicator,
   Linking,
   Text,
-  ScrollView,
   TouchableOpacity,
+  ScrollView,
 } from 'react-native';
-import { WebView, WebViewPermissionRequest } from 'react-native-webview';
+import { WebView } from 'react-native-webview';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'VideoCall'>;
 
+// Defina a URL correta da sua API
+const BACKEND_URL =
+  Platform.OS === 'android'
+    ? 'http://10.0.2.2:8000'
+    : 'http://localhost:8000';
+
 export default function VideoCall({ route, navigation }: Props) {
-  const { roomName } = route.params;
+  const { roomName, role } = route.params;
   const jitsiUrl = `https://meet.jit.si/${roomName}`;
 
-  // estados:
+  const [checking, setChecking] = useState(true);
+  const [granted, setGranted] = useState(false);
   const [acceptedTerms, setAcceptedTerms] = useState(false);
-  const [granted, setGranted]         = useState(false);
-  const [checking, setChecking]       = useState(true);
 
-  // 1) pedir permissões no Android
+  const [loadingAnalysis, setLoadingAnalysis] = useState(false);
+  const [analysisResults, setAnalysisResults] = useState<any[]>([]);
+
+  // 1) Permissões Android
   useEffect(() => {
     (async () => {
       if (Platform.OS === 'android') {
@@ -36,14 +44,15 @@ export default function VideoCall({ route, navigation }: Props) {
           PermissionsAndroid.PERMISSIONS.CAMERA,
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
         ]);
-        const okCam = res[PermissionsAndroid.PERMISSIONS.CAMERA] === 'granted';
-        const okMic = res[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] === 'granted';
-        if (!okCam || !okMic) {
+        if (
+          res[PermissionsAndroid.PERMISSIONS.CAMERA] !== 'granted' ||
+          res[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] !== 'granted'
+        ) {
           Alert.alert(
             'Permissões necessárias',
-            'Precisamos de câmera e microfone para a videochamada.',
+            'Precisamos de câmera e microfone.',
             [
-              { text: 'Cancelar', style: 'cancel', onPress: () => navigation.goBack() },
+              { text: 'Cancelar', onPress: () => navigation.goBack(), style: 'cancel' },
               { text: 'Configurações', onPress: () => Linking.openSettings() },
             ]
           );
@@ -55,96 +64,147 @@ export default function VideoCall({ route, navigation }: Props) {
     })();
   }, [navigation]);
 
-  // 2) enquanto verifica permissões
-  if (checking) {
-    return (
-      <View style={styles.loader}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
-  }
-  if (!granted) {
-    return (
-      <View style={styles.loader}>
-        <Text style={styles.infoText}>
-          Para continuar, habilite Câmera e Microfone nas configurações do app.
-        </Text>
-      </View>
-    );
-  }
-
-  // 3) se ainda não aceitou termos, exibe a tela de termos
+  if (checking) return <FullLoader />;
+  if (!granted) return <PermissionDenied />;
   if (!acceptedTerms) {
     return (
-      <View style={styles.termsContainer}>
-        <Text style={styles.termsTitle}>Termos e Condições</Text>
-        <ScrollView style={styles.termsTextContainer}>
-          <Text style={styles.termsText}>
-            • Esta sessão de teleconsulta será gravada para fins de registro clínico.{"\n\n"}
-            • As gravações serão armazenadas com acesso restrito e usadas somente pela equipe responsável.{"\n\n"}
-            • Você pode solicitar a exclusão ou cópia da gravação a qualquer momento, conforme a política de privacidade.{"\n\n"}
-            • Ao concordar, você autoriza o uso e armazenamento desta gravação.{"\n\n"}
-            • Todas as informações aqui tratadas são confidenciais e protegidas pelo Código de Ética Profissional.
-          </Text>
-        </ScrollView>
-        <View style={styles.termsButtons}>
-          <TouchableOpacity
-            style={[styles.btn, styles.btnDecline]}
-            onPress={() => navigation.goBack()}
-          >
-            <Text style={styles.btnText}>Recusar</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.btn, styles.btnAccept]}
-            onPress={() => setAcceptedTerms(true)}
-          >
-            <Text style={[styles.btnText, { color: '#fff' }]}>Aceitar</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
+      <TermsView
+        onAccept={() => setAcceptedTerms(true)}
+        onDecline={() => navigation.goBack()}
+      />
     );
   }
 
-  // 4) finalmente, renderiza o WebView com Jitsi
+  // 2) Chama o FastAPI e busca os resultados
+  const handleAnalyze = async () => {
+    setLoadingAnalysis(true);
+    try {
+      console.log('➡️ Fazendo request para', `${BACKEND_URL}/analyze-webcam`);
+      const res = await fetch(`${BACKEND_URL}/analyze-webcam`);
+      console.log('⬅️ Status da resposta:', res.status);
+      if (!res.ok) throw new Error(`Status ${res.status}`);
+      const json = await res.json();
+      console.log('⬅️ JSON recebido:', json);
+      setAnalysisResults(json.analysis || []);
+      Alert.alert('Análise concluída', `Recebemos ${json.analysis.length} frames.`);
+    } catch (e) {
+      console.error(e);
+      Alert.alert('Erro na análise', String(e));
+    } finally {
+      setLoadingAnalysis(false);
+    }
+  };
+
   return (
-    <WebView
-      source={{ uri: jitsiUrl }}
-      style={styles.webview}
-      javaScriptEnabled
-      allowsInlineMediaPlayback
-      mediaPlaybackRequiresUserAction={false}
-      onPermissionRequest={(event: WebViewPermissionRequest) => {
-        event.grant(event.resources);
-      }}
-      startInLoadingState
-      renderLoading={() => (
-        <View style={styles.loader}>
-          <ActivityIndicator size="large" />
+    <View style={styles.container}>
+      {/* Botão de análise apenas para Psicólogo */}
+      {role === 'Psicólogo' && (
+        <View style={styles.analysisContainer}>
+          <TouchableOpacity
+            style={styles.analysisButton}
+            onPress={handleAnalyze}
+            disabled={loadingAnalysis}
+          >
+            {loadingAnalysis ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.analysisButtonText}>Analisar Expressão</Text>
+            )}
+          </TouchableOpacity>
         </View>
       )}
-    />
+
+      {/* Exibição dos resultados */}
+      {analysisResults.length > 0 && (
+        <ScrollView style={styles.resultsContainer}>
+          {analysisResults.map((item, index) => (
+            <View key={index} style={styles.resultItem}>
+              <Text style={styles.resultText}>
+                <Text style={styles.bold}>Segundo:</Text> {item.second}
+              </Text>
+              <Text style={styles.resultText}>
+                <Text style={styles.bold}>Dominante:</Text> {item.dominant_emotion}
+              </Text>
+              <Text style={styles.resultText}>
+                <Text style={styles.bold}>Detalhes:</Text> {JSON.stringify(item.emotions)}
+              </Text>
+            </View>
+          ))}
+        </ScrollView>
+      )}
+
+      {/* WebView com Jitsi */}
+      <WebView
+        source={{ uri: jitsiUrl }}
+        style={styles.webview}
+        javaScriptEnabled
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
+        startInLoadingState
+        renderLoading={() => <FullLoader />}
+      />
+    </View>
   );
 }
 
+// Componentes auxiliares
+const FullLoader = () => (
+  <View style={styles.fullLoader}>
+    <ActivityIndicator size="large" color="#4B7BE5" />
+  </View>
+);
+
+const PermissionDenied = () => (
+  <View style={styles.fullLoader}>
+    <Text style={styles.infoText}>
+      Habilite câmera e microfone nas configurações.
+    </Text>
+  </View>
+);
+
+const TermsView = ({
+  onAccept,
+  onDecline,
+}: {
+  onAccept: () => void;
+  onDecline: () => void;
+}) => (
+  <View style={styles.termsContainer}>
+    <Text style={styles.termsTitle}>Termos e Condições</Text>
+    <Text style={styles.termsText}>
+      • Esta sessão será gravada para fins de registro clínico.{'\n\n'}
+      • Gravações restritas à equipe responsável.{'\n\n'}
+      • Solicite exclusão a qualquer momento.{'\n\n'}
+      • Ao concordar, autoriza armazenamento desta gravação.{'\n\n'}
+      • Todas as informações são confidenciais.
+    </Text>
+    <View style={styles.termsButtons}>
+      <TouchableOpacity style={[styles.btn, styles.btnDecline]} onPress={onDecline}>
+        <Text style={styles.btnText}>Recusar</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={[styles.btn, styles.btnAccept]} onPress={onAccept}>
+        <Text style={[styles.btnText, { color: '#fff' }]}>Aceitar</Text>
+      </TouchableOpacity>
+    </View>
+  </View>
+);
+
 const styles = StyleSheet.create({
-  webview: {
+  container: { flex: 1 },
+  webview: { flex: 1 },
+
+  fullLoader: {
     flex: 1,
-  },
-  loader: {
-    flex: 1,
-    alignItems: 'center',
     justifyContent: 'center',
+    alignItems: 'center',
   },
-  infoText: {
-    fontSize: 16,
-    color: '#666',
-    textAlign: 'center',
-  },
-  // termos
+  infoText: { textAlign: 'center', color: '#666' },
+
   termsContainer: {
     flex: 1,
-    padding: 20,
+    padding: 24,
     backgroundColor: '#fff',
+    justifyContent: 'center',
   },
   termsTitle: {
     fontSize: 22,
@@ -152,14 +212,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 16,
   },
-  termsTextContainer: {
-    flex: 1,
-    marginBottom: 16,
-  },
   termsText: {
     fontSize: 16,
     lineHeight: 24,
     color: '#333',
+    marginBottom: 24,
   },
   termsButtons: {
     flexDirection: 'row',
@@ -171,16 +228,43 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
   },
-  btnDecline: {
-    backgroundColor: '#eee',
-    marginRight: 8,
+  btnDecline: { backgroundColor: '#eee', marginRight: 8 },
+  btnAccept: { backgroundColor: '#4B7BE5', marginLeft: 8 },
+  btnText: { fontSize: 16, fontWeight: '600' },
+
+  analysisContainer: {
+    padding: 12,
+    backgroundColor: '#eef4fb',
+    alignItems: 'center',
   },
-  btnAccept: {
+  analysisButton: {
     backgroundColor: '#4B7BE5',
-    marginLeft: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 32,
+    borderRadius: 24,
   },
-  btnText: {
+  analysisButtonText: {
+    color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+
+  resultsContainer: {
+    maxHeight: 150,
+    backgroundColor: '#fff',
+    padding: 12,
+  },
+  resultItem: {
+    marginBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ddd',
+    paddingBottom: 8,
+  },
+  resultText: {
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  bold: {
+    fontWeight: '700',
   },
 });
